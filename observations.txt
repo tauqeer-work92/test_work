@@ -1,0 +1,16 @@
+1- Employer specific code might not be need as we don't have employer passed to call method.
+
+
+Steps  I performed to comply with new requirements
+1- Updated method to set active: false for all job across all job boards or for given employer
+2- Updated job transformation method to exclude active column
+3- Extended jobs upsert to update relevant job boards as well
+4- Updated the logic to get all new added jobs for job boards or employer specific job_boards
+5- We still need to update activation_histories, there might an update required that his should live in job_boards instead of job itself.
+
+- Then, consolidate ALL employers jobs into a single array
+- Then, use `update_all` to set all jobs in our Jobs table to active: false  before performing the Upsert
+   
+I think Your decision to turn all jobs to active is motivated by,
+false Make sure that any jobs not included in the most recent pull from the Employer's API are no longer shown as active in your Jobs table before proceeding with the Upsert.
+This guarantees that the only positions that are currently active in your database are those that are still published on the employer's website.

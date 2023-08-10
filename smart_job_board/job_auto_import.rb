@@ -26,11 +26,15 @@ class SmartJobBoard::JobAutoImport
           unique_by: [:ats_id]
         )
 
+        update_jobs_for_all_employers(all_jobs)
+
         all_jobs = nil # clear up memory
 
         set_activation_histories
+        #TODO We do need to update this as this job activation history might need to be moved to Jobs_job_boards table
         time = Time.now
-        new_jobs = Job.where(active: true, posted_by: Job.posted_by_options["Job Auto Import"], created_at: (time - 900)..time)
+        new_jobs = fetch_new_jobs(time)
+
         puts "latest_15_mins_jobs".concat(new_jobs.size.to_s)
         update_job_fields(new_jobs)
         reindex_jobs(new_jobs)  # this will only run at 10am UTC
@@ -50,6 +54,47 @@ class SmartJobBoard::JobAutoImport
 
     private
 
+    def update_jobs_for_all_employers(all_jobs, employer=nil)
+      current_ats_ids = all_jobs.map { |job| job[:ats_id] }
+      existing_jobs = Job.where(ats_id: current_ats_ids).pluck(:ats_id, :id).to_h
+
+      associations_for_upsert = []
+      employers_to_iterate = employer.nil? ? Employer.all : [employer]
+
+      employers_to_iterate.each do |current_employer|
+        board_ids = current_employer.job_boards.pluck(:id)
+        employer_jobs = all_jobs.select { |job| job[:employer_id] == current_employer.id }
+
+        employer_jobs.each do |job|
+          job_id = existing_jobs[job[:ats_id]]
+          next unless job_id
+
+          board_ids.each do |board_id|
+            associations_for_upsert << {
+                job_id: job_id,
+                job_board_id: board_id,
+                active: true
+            }
+          end
+        end
+      end
+
+      JobJobBoard.upsert_all(associations_for_upsert, unique_by: [:job_id, :job_board_id])
+    end
+
+    def fetch_new_jobs(time, employer=nil)
+      if employer
+        job_board_ids = employer.job_boards.pluck(:id)
+      else
+        job_board_ids = JobBoard.joins(:employers).pluck(:id).uniq
+      end
+  
+      new_jobs = Job.joins(:job_boards)
+                    .where(job_boards: { id: job_board_ids, active: true })
+                    .where(posted_by: Job.posted_by_options["Job Auto Import"], created_at: (time - 900)..time)
+      new_jobs
+    end
+
     def get_all_jobs
       begin
         employers = Employer.select(:id, :company_name, :email, :apply_url_tracking_params, :ats, :ats_url_param, :ats_key, :remote, :import_jobs, :company_description, :workday_credentials).where(active: true, deleted: false, import_jobs: true).where.not(ats: nil).where.not(ats: "team_tailor")
@@ -66,19 +111,38 @@ class SmartJobBoard::JobAutoImport
     end
 
     def deactivate_all_jobs(employer=nil)
-      begin
-        time = Time.now
-        return unless [9, 10, 11].include?(time.hour)
-        if employer.nil?
-          Job.where(active: true).where.not(ats_id: nil).update_all(active: false)
-        else
-          Job.where(employer_id: employer.id, active: true).where.not(ats_id: nil).update_all(active: false)
-        end
-        puts "deactivated all jobs | " + time.to_s
-      rescue => e
-        puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "deactivate_all_jobs_error" })
+      return unless time_to_deactivate?
+
+      if employer
+        deactivate_jobs_for_employer(employer)
+      else
+        deactivate_jobs_globally()
       end
+
+    rescue => e
+      puts e
+      @broken_imports.append({ "error"=> e.to_s, "source"=> "deactivate_all_jobs_error" })
+    end
+
+    def deactivate_all_jobs_for_employer(employer)
+      board_ids = employer.job_boards.pluck(:id)
+      JobJobBoard.where(job_board_id: board_ids).update_all(active: false)
+
+      puts "deactivated all Employer jobs | #{Time.now}"
+    end
+
+    def deactivate_jobs_globally
+      Job.joins(:job_boards).where(job_boards: { active: true }).update_all("job_boards.active = ?", false)
+      puts "deactivated all jobs | #{Time.now}"
+    end
+
+    def time_to_deactivate?
+      [9, 10, 11].include?(Time.now.hour)
+    end
+
+    def base_job_scope(employer)
+      scope = Job.joins(:job_boards).where(job_boards: { active: true })
+      scope.where(employer_id: employer.id)
     end
 
     def reindex_jobs(new_jobs)
@@ -475,8 +539,7 @@ class SmartJobBoard::JobAutoImport
     def transform_jobs(jobs, ats, employer, employer_object_mapping=nil)
       begin
         posted_by = "Job Auto Import"
-        status = "active"
-        select_keys = ['title', 'active', 'status', 'how_to_apply', 'description', 'employer_name', 'employer_id', 'location', 'remote', 'ats_id', 'posted_by', 'custom_fields', 'employer_logo']
+        select_keys = ['title', 'active', 'how_to_apply', 'description', 'employer_name', 'employer_id', 'location', 'remote', 'ats_id', 'posted_by', 'custom_fields', 'employer_logo']
         case ats
         when "lever"
           ats_id_prefix = "lev_"
@@ -484,7 +547,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['text']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('applyUrl').concat(employer&.apply_url_tracking_params.to_s)
             description_text = set_lever_description(job, employer)
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -506,7 +568,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('absolute_url').concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("content").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -527,7 +588,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('application_url').concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("description").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -550,7 +610,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('applyUrl').concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("descriptionHtml").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -571,7 +630,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job['careers_apply_url'].concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("description").to_s + job.delete("requirements").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -597,7 +655,6 @@ class SmartJobBoard::JobAutoImport
             employer = employer_object_mapping[job['company']]
             next unless employer.class == Employer
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job['applyurl']
             description_text = job['description'].to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -621,7 +678,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job['link'].concat(employer&.apply_url_tracking_params.to_s)
             description_text = job['description'][1].to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -643,7 +699,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['PositionTitle']
-            job['active'] = 1
             job['how_to_apply'] = job['ApplyUrl']
             description_text = job['Description'].to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -665,7 +720,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['name']
-            job['active'] = 1
             job['how_to_apply'] = job['url'].concat("/apply").concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("description").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -687,7 +741,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = "https://#{employer&.ats_url_param}.applytojob.com/apply/#{job['board_code']}?source=climatebase"
             description_text = job.delete("description").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -781,7 +834,6 @@ class SmartJobBoard::JobAutoImport
           ats_id_prefix = "perso_"
           jobs.map do |job|
             job['title'] = job['name']
-            job['active'] = 1
             job['how_to_apply'] = "https://#{employer.ats_url_param}.jobs.personio.de/job/#{job['id']}?language=en&display=en&gh_src=Climatebase#apply"
             description_text = get_personio_description(job)
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -804,7 +856,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job['detail_url'].concat(employer&.apply_url_tracking_params.to_s)
             description_text = job['description'].to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -826,7 +877,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('job_post_url').concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("description").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -848,7 +898,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('detail_url').concat(employer&.apply_url_tracking_params.to_s)
             description_text = job.delete("description").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
@@ -900,7 +949,6 @@ class SmartJobBoard::JobAutoImport
 
           jobs.map do |job|
             job['title'] = job['title']
-            job['active'] = 1
             job['how_to_apply'] = job.delete('url').concat("?source=Climatebase")
             description_text = job.delete("jobDescription").to_s
             description_text = description_text.present? ? description_text : employer&.company_description.to_s
